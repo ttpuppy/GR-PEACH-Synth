@@ -145,12 +145,31 @@ public:
 private:
     static const uint32_t kAudioThreadStackSize = 8192; // フルDSPエンジンのコールスタック分に余裕を持たせる
 
-    // 専用スレッドからwrite()を単純にループ呼び出しするだけ。
-    // write()自体がドライバ内部のキュー空き待ち(セマフォ)で自然にブロック
-    // するため、これだけで正しくパイプライン動作する
-    // （Renesas公式EasyPlaybackと同じ使い方。p_notify_funcはNULLでよい。
-    //  コールバックから次のwrite()を呼ぶと自己デッドロックになるため厳禁。
-    //  詳細はcodec/Pcm5102Ssif.h(別プロジェクト)で既に踏んだ経緯を参照）。
+    // 専用スレッドからwrite()をループ呼び出しする。
+    //
+    // 【今回のバグ修正（ポリフォニックノイズの根本原因）】
+    // 従来は「write()がドライバ内部のキュー空き待ちで自然にブロックする
+    // ため、fill→writeの単純ループで正しくパイプライン動作する」と
+    // 考えていたが、これは誤りだった。R_BSP_Aio.cpp の実装を確認した
+    // ところ:
+    //   - write(buf, size, &conf) は conf!=NULL の時点で非同期パス
+    //     (aio_trans)に入り、DMA要求をゼロコピーでキューに積んで
+    //     「即リターン」する（ブロックするのはmax_write_num本が
+    //     転送中のときだけ）
+    //   - 内部セマフォが返却されるのは各バッファの「DMA転送完了時」
+    // このため定常状態では、write(buf[N-1])が返った直後の fill(buf[0])
+    // が「DMAがまさに読んでいる最中の最古バッファ」を上書きしてしまい、
+    // 1ブロックにつき1個の継ぎ目不連続（実機スパイクノイズ）が発生する。
+    // 隣接ブロック間の波形差が大きいほど段差が大きくなるため、
+    // ボイス数を増やすとノイズが顕著になる（実測と一致）。
+    //
+    // 修正: 各writeに完了通知コールバック(p_notify_func)を設定し、
+    // 「空きバッファ数」を表すカウンティングセマフォ(bufFreeSem_)を
+    // fillの前にacquireする。完了は投入順(FIFO)に発生するため、
+    // acquire成功 = これから書くバッファのDMAが完了済み、が保証される。
+    // コールバック内ではセマフォreleaseのみ行う（「コールバックから
+    // 次のwrite()を呼ぶと自己デッドロック」の既知ルールは維持。
+    // 詳細はcodec/Pcm5102Ssif.h(別プロジェクト)の経緯を参照）。
     //
     // 【今回追加】ボイス数を増やすとノイズが乗るという実機報告を受け、
     // fillCallback_()（=SynthEngine::processBlock()、DSP処理本体）に
@@ -168,8 +187,8 @@ private:
     // ループがfetchTimingStats()で取得してprintfする方式に変更。
     void audioThreadLoop() {
         rbsp_data_conf_t conf;
-        conf.p_notify_func = NULL;
-        conf.p_app_data = NULL;
+        conf.p_notify_func = &Pcm5102Ssif0Output::onWriteComplete;
+        conf.p_app_data = this;
 
         const uint32_t kBudgetUs =
             (pcm5102_ssif0_detail::kBlockFrames * 1000000u) / 44100u; // ≈1451us
@@ -183,6 +202,11 @@ private:
 
         int idx = 0;
         while (running_) {
+            // これから書き込むバッファのDMA完了を待つ（上記コメント参照）。
+            // acquire待ち時間はDSP処理時間ではないため、タイマー/プローブの
+            // 計測区間には含めない。
+            bufFreeSem_.acquire();
+
             timer.reset();
             timer.start();
             int16_t* buf = pcm5102_ssif0_detail::g_audioBuffers[idx];
@@ -222,10 +246,22 @@ private:
         }
     }
 
+    // DMA転送完了ごとに「空きバッファ」トークンを1つ返却する。
+    // ドライバはSIGEV_THREAD相当のコンテキストからこれを呼ぶ。
+    // ここでは絶対にwrite()を呼ばないこと（自己デッドロック）。
+    static void onWriteComplete(void* /*p_data*/, int32_t /*result*/, void* p_app_data) {
+        static_cast<Pcm5102Ssif0Output*>(p_app_data)->bufFreeSem_.release();
+    }
+
     R_BSP_Ssif ssif_;
     Thread audioThread_;
     AudioFillCallback fillCallback_;
     volatile bool running_ = false;
+
+    // 空きバッファ数を表すカウンティングセマフォ。初期値=全バッファ空き。
+    // fill前にacquire、DMA完了コールバックでrelease。
+    rtos::Semaphore bufFreeSem_{pcm5102_ssif0_detail::kNumBuffers,
+                                pcm5102_ssif0_detail::kNumBuffers};
 
 #ifdef AUDIO_TIMING_PROBE_PIN
     DigitalOut timingProbe_{AUDIO_TIMING_PROBE_PIN, 0};
