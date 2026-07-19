@@ -1,0 +1,9 @@
+{
+    "name": "gr-peach-synth",
+    "config": {
+        "target-board": {
+            "help": "Board identifier for documentation purposes",
+            "value": "\"GR-PEACH\""
+        }
+    }
+}

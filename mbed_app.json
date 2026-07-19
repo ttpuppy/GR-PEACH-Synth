@@ -1,0 +1,26 @@
+{
+    "config": {
+        "sample-rate-hz": {
+            "help": "Audio engine sample rate in Hz (44100 fixed: only rate the onboard 22.5792MHz audio crystal divides evenly for SSIF I2S clocking, regardless of channel; see dsp/SynthConfig.h)",
+            "value": 44100
+        },
+        "num-voices": {
+            "help": "Polyphony voice count (4-8 per design doc phase 4)",
+            "value": 8
+        }
+    },
+    "target_overrides": {
+        "*": {
+            "target.printf_lib": "std",
+            "platform.stdio-baud-rate": 115200,
+            "platform.stdio-convert-newlines": true
+        },
+        "RZ_A1H": {
+            "target.macros_add": [
+                "SYNTH_SAMPLE_RATE_HZ=44100",
+                "SYNTH_NUM_VOICES=8"
+            ],
+            "target.device_has_add": ["USBDEVICE"]
+        }
+    }
+}
