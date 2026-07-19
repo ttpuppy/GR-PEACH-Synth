@@ -3,6 +3,17 @@
 // パネルUI/OLEDを持たない「音生成専任」構成のため、音作りはこのファイルの
 // define値を書き換えてビルドし直す運用とする。
 // dsp/Patch.h の Patch構造体のデフォルトメンバ初期化子がこれらのdefineを参照する。
+//
+// 【今回の変更（波形検証セッション）】
+// SYNTH_DELAY_MIX / SYNTH_CHORUS_MIX を 0.25 -> 0.0 に変更（エフェクトは
+// デフォルトOFF）。
+// 理由：全プリセットに常時コーラスが掛かっており、コーラスのウェット側は
+// 変調ディレイによる実質ピッチシフト（depth0.3/rate0.6Hzで最大約±40セント）
+// になるため、ドライとの干渉でスコープ上に振幅のうねり（ビート）が出ていた。
+// ディレイ(280ms)も常時ONで、波形に過去のコピーが重畳していた。
+// TIME/FEEDBACK/RATE/DEPTH系のdefineは「ONにしたときの初期値」として従来値の
+// まま残す。エフェクトを使うプリセットは PatchBank::initDefaults() 内で
+// 個別に delayMix / chorusMix を設定する（dsp/Patch.h 参照）。
 
 #pragma once
 
@@ -47,12 +58,13 @@
 #define SYNTH_PORTAMENTO_MS  0.0f
 
 // ---- エフェクト ----
+// mix系はデフォルト0（OFF）。TIME/FEEDBACK/RATE/DEPTHはONにしたときの初期値。
 #define SYNTH_DELAY_TIME_MS   280.0f
 #define SYNTH_DELAY_FEEDBACK  0.35f
-#define SYNTH_DELAY_MIX       0.25f
+#define SYNTH_DELAY_MIX       0.0f    // 旧: 0.25f（常時ON） -> デフォルトOFF
 #define SYNTH_CHORUS_RATE_HZ  0.6f
 #define SYNTH_CHORUS_DEPTH    0.3f
-#define SYNTH_CHORUS_MIX      0.25f
+#define SYNTH_CHORUS_MIX      0.0f    // 旧: 0.25f（常時ON） -> デフォルトOFF
 
 // ---- マスター ----
 #define SYNTH_MASTER_VOLUME   0.8f
