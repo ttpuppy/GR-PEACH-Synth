@@ -155,6 +155,22 @@ int main() {
         // 削除。SSIF5生レジスタ版のポーリング実装と違い、こちらは
         // R_BSP_Ssifの内部キュー機構が自然にパイプライン動作する）。
 
+        // 【今回追加】オーディオスレッドがpublishした計測統計をここでprintfする。
+        // （printfをオーディオスレッド内で行うと約145msのブロッキング
+        //   グリッチが発生することが過去の検証で確認済みのため、出力は
+        //   必ずメインループ側で行う。codec/Pcm5102Ssif0Output.h参照）
+        {
+            Pcm5102Ssif0Output::AudioTimingStats ts;
+            if (gAudio->fetchTimingStats(ts)) {
+                printf("[AudioTiming] budget=%luus avg=%luus max=%luus over_budget=%lu/%lu\r\n",
+                       static_cast<unsigned long>(ts.budgetUs),
+                       static_cast<unsigned long>(ts.avgUs),
+                       static_cast<unsigned long>(ts.maxUs),
+                       static_cast<unsigned long>(ts.overBudget),
+                       static_cast<unsigned long>(ts.blocks));
+            }
+        }
+
         if ((tick++ % 500) == 0) {
             *gLedUser = !*gLedUser;
         }

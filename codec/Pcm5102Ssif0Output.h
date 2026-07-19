@@ -41,6 +41,16 @@
 #include "../hal/AudioOutputHAL.h"
 #include "R_BSP_Ssif.h"
 
+// 【今回追加】DSP処理時間のGPIOプローブ。
+// fillCallback_(=SynthEngine::processBlock)の実行中だけこのピンをHighにする。
+// Analog Discovery 2のデジタルchで観測すれば、High時間=1ブロックの生成時間を
+// 直接計測でき、リアルタイム予算(64フレーム@44.1kHz=約1.451ms)に対する
+// 余裕がボイス数によってどう変わるかをスパイク発生と同時相関で確認できる。
+// 計測が終わったらこのdefineをコメントアウトすればプローブごと消える。
+// 注意: D2/D4/D5はSSIF0が使用中のため使用不可。D6で"pinmap not found"等が
+// 出る場合は他の空きデジタルピンに変更すること（InitTraceのログで切り分け可能）。
+#define AUDIO_TIMING_PROBE_PIN D6
+
 namespace synth {
 
 namespace pcm5102_ssif0_detail {
@@ -110,6 +120,28 @@ public:
         audioThread_.join();
     }
 
+    // 【今回追加】オーディオスレッドが約2秒ごとに publish する計測統計。
+    // メインループ側から fetchTimingStats() で取得し、printfはそちらで行う
+    // （printfをオーディオスレッドに置いてはならない。上記コメント参照）。
+    struct AudioTimingStats {
+        uint32_t budgetUs;    // 1ブロックのリアルタイム予算(us)
+        uint32_t avgUs;       // 期間内の平均fill時間(us)
+        uint32_t maxUs;       // 期間内の最大fill時間(us)
+        uint32_t overBudget;  // 予算超過したブロック数
+        uint32_t blocks;      // 期間内の総ブロック数
+    };
+
+    // 新しい統計ウィンドウが確定していればoutにコピーしてtrueを返す。
+    // 単一writer(オーディオスレッド)/単一reader(メインループ)前提の
+    // 簡易フラグ同期。ウィンドウは約2秒、読み出しは1msポーリングなので
+    // 実用上の競合は無視できる（診断用途）。
+    bool fetchTimingStats(AudioTimingStats& out) {
+        if (!statsReady_) return false;
+        out = publishedStats_;
+        statsReady_ = false;
+        return true;
+    }
+
 private:
     static const uint32_t kAudioThreadStackSize = 8192; // フルDSPエンジンのコールスタック分に余裕を持たせる
 
@@ -124,9 +156,16 @@ private:
     // fillCallback_()（=SynthEngine::processBlock()、DSP処理本体）に
     // かかる実時間を計測し、1ブロック分のリアルタイム予算
     // (kBlockFrames/サンプルレート、64フレーム@44100Hzなら約1.45ms)を
-    // 超えていないか一定間隔でシリアルに出力するようにした。
+    // 超えていないか確認できるようにした。
     // 超えている場合、CPU処理がリアルタイム再生に追いつけていないこと
     // （ノイズの直接原因）が実測で確認できる。
+    //
+    // 【今回修正】統計のprintfをオーディオスレッド内から排除した。
+    // 過去の検証で「audio threadでのprintfは約145msのブロッキング
+    // グリッチを起こす」ことが確認済みであり、スレッド内printfでは
+    // 2秒ごとに自らノイズを注入しながらノイズを測ることになるため。
+    // 統計はpublishedStats_に書き出すだけにして、main.cppのメイン
+    // ループがfetchTimingStats()で取得してprintfする方式に変更。
     void audioThreadLoop() {
         rbsp_data_conf_t conf;
         conf.p_notify_func = NULL;
@@ -147,7 +186,13 @@ private:
             timer.reset();
             timer.start();
             int16_t* buf = pcm5102_ssif0_detail::g_audioBuffers[idx];
+#ifdef AUDIO_TIMING_PROBE_PIN
+            timingProbe_.write(1); // High区間 = DSP処理時間（AD2デジタルchで観測）
+#endif
             fillCallback_(buf, pcm5102_ssif0_detail::kBlockFrames);
+#ifdef AUDIO_TIMING_PROBE_PIN
+            timingProbe_.write(0);
+#endif
             timer.stop();
             uint32_t elapsedUs = static_cast<uint32_t>(timer.elapsed_time().count());
 
@@ -159,15 +204,16 @@ private:
             ssif_.write(buf, sizeof(pcm5102_ssif0_detail::g_audioBuffers[idx]), &conf);
             idx = (idx + 1) % pcm5102_ssif0_detail::kNumBuffers;
 
-            // 約2秒(44100Hz/64フレーム毎ブロックなので約1378ブロック)ごとに統計を出力
+            // 約2秒(44100Hz/64フレーム毎ブロックなので約1378ブロック)ごとに
+            // 統計を確定してpublishする（printfはメインループ側で行う）。
             if (++reportCounter >= 1378) {
                 reportCounter = 0;
-                printf("[AudioTiming] budget=%luus avg=%luus max=%luus over_budget=%lu/%lu\r\n",
-                       static_cast<unsigned long>(kBudgetUs),
-                       static_cast<unsigned long>(sumUs / sampleCount),
-                       static_cast<unsigned long>(maxUs),
-                       static_cast<unsigned long>(overBudgetCount),
-                       static_cast<unsigned long>(sampleCount));
+                publishedStats_.budgetUs   = kBudgetUs;
+                publishedStats_.avgUs      = static_cast<uint32_t>(sumUs / sampleCount);
+                publishedStats_.maxUs      = maxUs;
+                publishedStats_.overBudget = overBudgetCount;
+                publishedStats_.blocks     = sampleCount;
+                statsReady_ = true;
                 maxUs = 0;
                 sumUs = 0;
                 sampleCount = 0;
@@ -180,6 +226,12 @@ private:
     Thread audioThread_;
     AudioFillCallback fillCallback_;
     volatile bool running_ = false;
+
+#ifdef AUDIO_TIMING_PROBE_PIN
+    DigitalOut timingProbe_{AUDIO_TIMING_PROBE_PIN, 0};
+#endif
+    AudioTimingStats publishedStats_ = {};
+    volatile bool statsReady_ = false;
 };
 
 } // namespace synth
